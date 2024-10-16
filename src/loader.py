@@ -1,5 +1,6 @@
 import requests
 import click
+import json
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -14,6 +15,14 @@ DATASETS = [
     'article-4-direction-area',
     'conservation-area'
 ]
+
+def get_planning_data_datasets():
+
+    response = requests.get('https://www.planning.data.gov.uk/dataset.json')
+    response.raise_for_status()
+    content = response.json()
+    datasets = [dataset['dataset'] for dataset in content['datasets'] if dataset['entity-count'] > 0]
+    return datasets
 
 def remove_dir_contents(path):
     for item in path.iterdir():
@@ -55,9 +64,9 @@ def download_and_convert_to_parquet(url, output_file, chunksize=1000000):
         return None
 
 # Create Snowflake session
-def create_snowflake_session(conn_details):
+def create_snowflake_session(conn_params):
     try:
-        session = Session.builder.configs(conn_details).create()
+        session = Session.builder.configs(conn_params).create()
         print("Snowflake session created successfully.")
         return session
     except ProgrammingError as e:
@@ -65,28 +74,35 @@ def create_snowflake_session(conn_details):
         raise e
 
 # Upload Parquet data in batches to Snowflake
-def upload_parquet_to_snowflake(parquet_file,conn_details,table_name=None, batch_size=1000):
+def upload_parquet_to_snowflake(parquet_file,conn_params,table_name=None, batch_size=1000000):
     if table_name is None:
         table_name = Path(parquet_file).stem.replace('-','_')
 
-    session = create_snowflake_session(conn_details)
-    
+    session = create_snowflake_session(conn_params)
+
+    # remove current data
+    check_sql = f"SELECT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{conn_params['schema']}');"
+    table_exists = session.sql(check_sql).collect()[0][0]
+
+    if table_exists:
+        truncate_sql = f"TRUNCATE TABLE {conn_params['database']}.{conn_params['schema']}.\"{table_name}\";"
+        session.sql(truncate_sql).collect()
+
     if session is None:
         return
 
     try:
         # Read Parquet file in batches and write to Snowflake
         parquet_reader = pq.ParquetFile(parquet_file)
-        num_rows = parquet_reader.metadata.num_rows
+        num_row_groups = parquet_reader.num_row_groups
         
-        for batch_start in range(0, num_rows, batch_size):
-            batch_end = min(batch_start + batch_size, num_rows)
-            table = parquet_reader.read_row_group(batch_start // batch_size)
+        for row_group in range(0, num_row_groups):
+            table = parquet_reader.read_row_group(row_group)
             batch_df = table.to_pandas()
             
             # Write to Snowflake DataFrame
             session.write_pandas(batch_df, table_name, overwrite=False,auto_create_table=True)
-            print(f"Uploaded rows {batch_start} to {batch_end} to Snowflake.")
+            print(f"Uploaded row group {row_group} to Snowflake.")
         
     except Exception as e:
         print(f"Failed to upload data to Snowflake: {e}")
@@ -107,8 +123,9 @@ def upload_parquet_to_snowflake(parquet_file,conn_details,table_name=None, batch
 @click.option("--use-cache",is_flag=True,default=True)
 def load(user,password,account,database,schema,warehouse,chunksize,use_cache):
     cache_dir = Path('./cache')
-
-    connection_details = {
+    # organise connection details 
+    # TODO look at a better way of getting this
+    conn_params = {
         "user":user,
         "password":password,
         "account":account,
@@ -116,20 +133,34 @@ def load(user,password,account,database,schema,warehouse,chunksize,use_cache):
         "schema":schema,
         "warehouse":warehouse,
     }
+
+
+    datasets = get_planning_data_datasets()
+
+
     if cache_dir.exists() and use_cache is False:
         remove_dir_contents(cache_dir)
         cache_dir.rmdir()
         cache_dir.mkdir(parents=True)
 
+    dataset_list_file = cache_dir / 'dataset_list.json'
+    if dataset_list_file.exists():
+        with open(dataset_list_file, 'r') as json_file:
+            datasets = json.load(json_file)
 
-    for dataset in DATASETS:
+    else:
+        datasets = get_planning_data_datasets()
+        with open(dataset_list_file, 'w') as json_file:
+                json.dump(datasets, json_file, indent=4)
+
+    for dataset in datasets:
         output_file=f'./cache/{dataset}.parquet'
         if not Path(output_file).exists():
             csv_url = f"https://files.planning.data.gov.uk/dataset/{dataset}.csv"
             output_file = download_and_convert_to_parquet(csv_url,output_file=output_file,chunksize=chunksize)
 
         if output_file:
-            upload_parquet_to_snowflake(output_file,connection_details)
+            upload_parquet_to_snowflake(output_file,conn_params)
 
 
 if __name__ == "__main__":
