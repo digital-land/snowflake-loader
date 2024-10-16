@@ -1,0 +1,5 @@
+snowflake-connector-python
+snowflake-snowpark-python
+pandas
+pyarrow
+click
